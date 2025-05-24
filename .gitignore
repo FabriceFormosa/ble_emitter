@@ -1,6 +1,20 @@
-# editors
-*.swp
-*~
+# Ne pas versionner les dossiers de build
+build/
+zephyr/
 
-# build
-/build*/
+# Fichiers temporaires de west
+*.log
+*.pyc
+*.swp
+*.swo
+*.user
+
+# Fichiers générés
+*.o
+*.elf
+*.hex
+*.bin
+
+# Dossiers temporaires d'IDE (VS Code, etc.)
+.vscode/
+.idea/
