@@ -8,60 +8,81 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
 
+ 
 
 #define UART_DEVICE_NODE DT_NODELABEL(uart0)
-#define TRAME_DATA_MAX_LEN 14
 
-struct trame_ble {
-    uint8_t start;
-    uint8_t cmd;
-    uint8_t size; // Nombre de caractères contenu dans le champ data
-    uint8_t data[TRAME_DATA_MAX_LEN];
-    uint8_t checksum;
-    uint8_t end;
+enum 
+{
+    CMD1_TX = 0x00,
+    CMD2_TX = 0x01,
+    CMD3_TX = 0x10, // opto
+    CMD4_TX = 0x20,
+    CMD5_TX = 0x30,
+    CMD6_TX = 0x31,
+    CMD7_TX = 0x32,
+
 };
 
+enum 
+{
+    CMD1_RX = 0x30,
+    CMD2_RX = 0x31,
+    CMD3_RX = 0x32,
+    CMD4_RX = 0x40,
+};
+
+static void optos_read_handler(struct k_work *work);
 static const struct device *uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+void build_trame(uint8_t cmd, const uint8_t *pdata, uint8_t size_data);
+static void trame_notify(struct k_work *work);
+void send_ble(uint8_t *ptrame , int len_trame);
+
+bool notif_enabled = false;
+
+#define TRAME_SIZE 14
+
+static uint8_t uart_buffer[TRAME_SIZE];
+static size_t uart_buf_pos = 0;
 
 void uart_cb(const struct device *dev, void *user_data)
 {
     while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
-        uint8_t buf[16];
-        int recv_len = uart_fifo_read(dev, buf, sizeof(buf));
-        for (int i = 0; i < recv_len; i++) {
-            uint8_t c = buf[i];
-            // traite c
+        uint8_t c;
+        int recv = uart_fifo_read(dev, &c, 1);
+        if (recv > 0) {
             printk("UART reçu: 0x%02X\n", c);
+            
+            uart_buffer[uart_buf_pos++] = c;
+
+            if (uart_buf_pos == TRAME_SIZE) {
+                // Trame complète reçue
+                build_trame(CMD4_TX, uart_buffer, TRAME_SIZE);
+                uart_buf_pos = 0; // Réinitialise le buffer pour la prochaine trame
+            }
         }
     }
 }
 
-void build_trame(struct trame_ble *trame, uint8_t cmd, const uint8_t *data, uint8_t size);
-static void trame_notify(struct k_work *work);
-void send_ble_update(struct trame_ble *ptrame);
-K_WORK_DELAYABLE_DEFINE(trame_work, trame_notify);
+
 
 static struct bt_conn *current_conn;
 
 /*******************************************************************************/
-#define BTN_COUNT 4
+#define OPTOS_COUNT 4
 
-static const struct gpio_dt_spec buttons[BTN_COUNT] = {
+
+static const struct gpio_dt_spec optos[OPTOS_COUNT] = {
     GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios),
     GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios),
     GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios),
     GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios)
 };
 
-static struct gpio_callback button_cbs[BTN_COUNT];
+static struct gpio_callback optos_cbs[OPTOS_COUNT];
 
-//extern struct bt_conn *current_conn; // défini dans ton code BLE
-//extern uint8_t trame_data[14];       // supposé déjà défini
-
-
-
+static uint8_t optos_state[OPTOS_COUNT] = {0};
 
 /************************************************************************************/
 #define BT_UUID_MODEL_NUMBER_STRING BT_UUID_DECLARE_16(0x2A24)
@@ -92,96 +113,101 @@ static const struct gpio_dt_spec led_receive = GPIO_DT_SPEC_GET(LED1_RECEIVE, gp
 #define TRAME_INTERVAL K_SECONDS(5)
 
 /* === Données à transmettre === */
-static uint8_t trame_data_tor[24] = {   0x00, 0x01, 0x00, 0x00,0x00, 0x00, 0x00, 0x00 ,
+static uint8_t trame_data_opto_debug[4] = {   0x00, 0x00, 0x00, 0x00 };
+static uint8_t trame_data_opto[24] = {   0x00, 0x01, 0x00, 0x00,0x00, 0x00, 0x00, 0x00 ,
                                     0x01, 0x00, 0x00, 0x00,0x00, 0x00, 0x00, 0x00 ,
                                     0x00, 0x00, 0x00, 0x00,0x00, 0x00, 0x00, 0x01 };
 
-static uint8_t trame_data[14] = {   0x01, 0x01, 0x01, 0x01,0x01, 0x01, 0x01,
-                                    0x01, 0x01, 0x01, 0x01,0x01, 0x01, 0x01 };
 
+K_WORK_DELAYABLE_DEFINE(optos_read_work, optos_read_handler);
 
-
-static uint8_t trame_cmd = 0x10;// envoi TOR 0x20; // Envoi Pesée
-
-
-
-
-
-const struct device *uart1 = DEVICE_DT_GET(DT_NODELABEL(uart0));
-
-
-
-static void button_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static void optos_read_handler(struct k_work *work)
 {
-    for (int i = 0; i < BTN_COUNT; i++) {
-        if (BIT(buttons[i].pin) & pins) {
-            int val = gpio_pin_get_dt(&buttons[i]);
+    read_optos_state();
+    k_work_schedule(&optos_read_work, TRAME_INTERVAL); // relance toutes les 10 sec
+}
+static void optos_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    for (int i = 0; i < OPTOS_COUNT; i++) {
+        if (BIT(optos[i].pin) & pins) {
+            int val = gpio_pin_get_dt(&optos[i]);
             if (val >= 0) {
-                trame_data[i] = (uint8_t)val;
-                printk("Bouton %d changé : %d\n", i, val);
-
-                  struct trame_ble trame;
-                    
-                build_trame(&trame, trame_cmd, trame_data, sizeof(trame_data));
-
-                send_ble_update(&trame);
+                trame_data_opto_debug[i] = (uint8_t)val;
+                printk("Opto %d changé : %d\n", i, val);
+                build_trame(CMD3_TX, trame_data_opto_debug, sizeof(trame_data_opto_debug));
             }
         }
     }
 }
 
-void init_buttons(void)
+void init_optos(void)
 {
-    for (int i = 0; i < BTN_COUNT; i++) {
-        if (!device_is_ready(buttons[i].port)) {
-            printk("Bouton %d non prêt\n", i);
+    for (int i = 0; i < OPTOS_COUNT; i++) {
+        if (!device_is_ready(optos[i].port)) {
+            printk("Opto %d non prêt\n", i);
             continue;
         }
 
-        gpio_pin_configure_dt(&buttons[i], GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&buttons[i], GPIO_INT_EDGE_BOTH);
+        gpio_pin_configure_dt(&optos[i], GPIO_INPUT);
+        gpio_pin_interrupt_configure_dt(&optos[i], GPIO_INT_EDGE_BOTH);
 
-        gpio_init_callback(&button_cbs[i], button_handler, BIT(buttons[i].pin));
-        gpio_add_callback(buttons[i].port, &button_cbs[i]);
+        gpio_init_callback(&optos_cbs[i], optos_handler, BIT(optos[i].pin));
+        gpio_add_callback(optos[i].port, &optos_cbs[i]);
 
-        printk("Bouton %d initialisé sur pin %d\n", i, buttons[i].pin);
+        printk("optos %d initialisé sur pin %d\n", i, optos[i].pin);
     }
 }
 
-
-
-void build_trame(struct trame_ble *trame, uint8_t cmd, const uint8_t *data, uint8_t size)
+void read_optos_state(void)
 {
-    memcpy(trame->data, data, size);
-
-    trame->start = '<';
-    trame->cmd = cmd;
-    trame->size = size;
-
-     
-   // Le checksum est calculé en effectuant la somme de tous les octets 
-   // composants la trame à l'exception de l'octet de début de trame, 
-   // de fin de trame et de ceux contenus dans le champ checksum
-
-    // Calcul du checksum : somme de cmd + size + data[]
-   // Calcul du checksum = cmd + size + chaque octet de data[]
-    uint8_t checksum = 0;
-    checksum += trame->cmd;
-    checksum += trame->size;
-    for (uint8_t i = 0; i < size; i++) {
-        checksum += trame->data[i];
+    for (int i = 0; i < OPTOS_COUNT; i++) {
+        int val = gpio_pin_get_dt(&optos[i]);
+        if (val >= 0) {
+            optos_state[i] = (uint8_t)val;
+            printk("Optos %d lu périodiquement : %d\n", i, val);
+        }
     }
-    trame->checksum = checksum;
 
-    trame->end = '>';
+    build_trame(CMD3_TX, optos_state, OPTOS_COUNT);
 }
+
+
+void build_trame(uint8_t cmd, const uint8_t *pdata, uint8_t size_data)
+{
+    uint8_t i;
+    uint8_t trame_len = size_data + 5; // < + cmd + size + data + checksum + >
+    uint8_t *trame_buffer = k_malloc(trame_len);
+
+    if (!trame_buffer) {
+        printk("Erreur d'allocation mémoire pour la trame\n");
+        return;
+    }
+
+    trame_buffer[0] = '<';
+    trame_buffer[1] = cmd;
+    trame_buffer[2] = size_data;
+    memcpy(&trame_buffer[3], pdata, size_data);
+
+    uint8_t checksum = cmd + size_data;
+    for (i = 0; i < size_data; i++) {
+        checksum += pdata[i];
+    }
+
+    trame_buffer[3 + size_data] = checksum;
+    trame_buffer[4 + size_data] = '>';
+
+    send_ble(trame_buffer, trame_len);
+
+    k_free(trame_buffer);
+}
+
 
 
 
 /* === CCCD callback === */
 static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
-    bool notif_enabled = (value == BT_GATT_CCC_NOTIFY);
+    notif_enabled = (value == BT_GATT_CCC_NOTIFY);
     printk("Notification %s\n", notif_enabled ? "activée" : "désactivée");
 
     if (notif_enabled && current_conn) {
@@ -189,23 +215,15 @@ static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
         u_int8_t name[] = "Apli";
         u_int8_t version[] = "1.0";
         u_int8_t info[100] ;
-       snprintf((char *)info, sizeof(info), "%s;%s", name, version);
-
-        struct trame_ble trame;
-                    
-        build_trame(&trame, 0x01, info, sizeof(info));
-
-        send_ble_update(&trame);
-
-
-        k_work_schedule(&trame_work, TRAME_INTERVAL);
+        int len = snprintf((char *)info, sizeof(info), "%s;%s", name, version);
+        build_trame(CMD2_TX, info, len );
     }
 }
 
 
 
-/* === read_cmd from client === */
-static ssize_t read_cmd(struct bt_conn *conn,
+/* === write_cmd from client === */
+static ssize_t write_cmd(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             const void *buf,
                             uint16_t len,
@@ -274,81 +292,54 @@ BT_GATT_SERVICE_DEFINE(device_info_svc,
                            ble_version_read, NULL, NULL)
 );
 
+
 BT_GATT_SERVICE_DEFINE(trame_svc,
+    // En BLE, un service est une collection de caractéristiques (characteristics) qui fournissent des fonctionnalités liées.
+   // Un service primaire est un service principal qu’un client BLE peut découvrir pour comprendre ce que le périphérique propose.
     BT_GATT_PRIMARY_SERVICE(&ble_service_uuid.uuid),
 
-
+    //Cette caractéristique a la propriété de notifier le client quand sa valeur change (en envoyant des notifications BLE).
       BT_GATT_CHARACTERISTIC(&ble_sent_uuid.uuid,
-                                BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_WRITE | BT_GATT_PERM_READ,
-                       NULL, NULL, NULL),
-                       
+                              BT_GATT_CHRC_NOTIFY,
+                              BT_GATT_PERM_READ,
+                                NULL, NULL, NULL),
+    // Client Characteristic Configuration 
+    // Sert à autoriser ou désactiver les notifications ou indications côté client 
+    // Dans la structure GATT, le descripteur CCC est lié à la caractéristique précédente   
+    // BT_GATT_CCC est un descripteur de la caractéristique notify.           
      BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
+    // C’est la fonction appelée côté serveur (ici dans le firmware) quand le client envoie une écriture sur cette caractéristique. 
+    // Cela permet d’interpréter la donnée reçue, déclencher une action, stocker une valeur
     BT_GATT_CHARACTERISTIC(&ble_data_uuid.uuid,
-          BT_GATT_CHRC_WRITE | BT_GATT_CHRC_READ,
-                       BT_GATT_PERM_WRITE | BT_GATT_PERM_READ,
-    
-                           NULL, read_cmd, NULL),
+          BT_GATT_CHRC_WRITE ,
+            BT_GATT_PERM_WRITE ,
+                           NULL, write_cmd, NULL),
+    );
 
     
 
   
  
-);
 
 
-
-void send_ble_update(struct trame_ble *ptrame)
+void send_ble(uint8_t *ptrame,int len_trame)
 {
-  
-    uint8_t *p = ptrame;
-    
+    if( !notif_enabled)
+     return;
 
     if (current_conn) {
-        int err = bt_gatt_notify(current_conn, &trame_svc.attrs[1], ptrame, sizeof(struct trame_ble));
+        int err = bt_gatt_notify(current_conn, &trame_svc.attrs[1], ptrame, len_trame);
         if (err) {
             printk("Erreur notification BLE : %d\n", err);
         } else {
-            printk("Trame mise à jour envoyée : ");
-        for (int i = 0; i < sizeof(struct trame_ble); i++) {
-            printk("%02X ", *p++);
-        }
-        printk("\n");
-        }
-    }
-}
-/* === Notification périodique === */
-static void trame_notify(struct k_work *work)
-{
-    if (!current_conn) return;
-
-
-    
-    struct trame_ble trame;
-     uint8_t *ptrame = (uint8_t *)&trame;
-    build_trame(&trame, trame_cmd, trame_data, sizeof(trame_data));
-    
-
-
-
-    int err = bt_gatt_notify(current_conn, &trame_svc.attrs[2], &trame, sizeof(trame));
-    
-    if (err) {
-        printk("Erreur de notification : %d\n", err);
-    } else {
-        printk("Trame envoyée : ");
-        for (int i = 0; i < sizeof(trame); i++) {
+            printk("Trame %02X mise à jour envoyée : ",ptrame[2]);
+        for (int i = 0; i < len_trame; i++) {
             printk("%02X ", ptrame[i]);
         }
         printk("\n");
-
-        gpio_pin_set_dt(&led_emit, 1);
-        k_msleep(100);
-        gpio_pin_set_dt(&led_emit, 0);
+        }
     }
-
-    k_work_schedule(&trame_work, TRAME_INTERVAL);
 }
 
 /* === Connexion BLE === */
@@ -360,11 +351,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
         char addr[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
         printk("Device connected: %s\n", addr);
-
-        
- 
-     
-
         
     }
 }
@@ -381,17 +367,17 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = disconnected,
     
 };
-
+/* 
 static void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
 {
     printk("MTU négociée : TX = %d, RX = %d\n", tx, rx);
 }
 static struct bt_gatt_cb gatt_callbacks = {
     .att_mtu_updated = mtu_updated,
-};
+}; */
 
 /* === main === */
-void main(void)
+int main(void)
 {
     int err;
 
@@ -399,37 +385,37 @@ void main(void)
 
  if (!device_is_ready(uart_dev)) {
         printk("UART device not ready\n");
-        return;
+        return 0 ;
     }
 
     uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
     uart_irq_rx_enable(uart_dev);
 
     /************************************************************/
-    init_buttons();
+    init_optos();
     /*************************************************************/
 
     if (!gpio_is_ready_dt(&led_emit)) {
         printk("LED Emit non disponible\n");
-        return;
+        return 0;
     }
 
     err = gpio_pin_configure_dt(&led_emit, GPIO_OUTPUT_INACTIVE);
     if (err < 0) {
         printk("Erreur configuration LED\n");
-        return;
+        return 0;
     }
 
     
     if (!gpio_is_ready_dt(&led_receive)) {
         printk("LED Receive non disponible\n");
-        return;
+        return 0;
     }
 
     err = gpio_pin_configure_dt(&led_receive, GPIO_OUTPUT_INACTIVE);
     if (err < 0) {
         printk("Erreur configuration LED Receive\n");
-        return;
+        return 0;
     }
 
     gpio_pin_set_dt(&led_emit, 1);
@@ -440,16 +426,21 @@ void main(void)
     err = bt_enable(NULL);
     if (err) {
         printk("Bluetooth init échouée (%d)\n", err);
-        return;
+        return 0;
     }
 
-    
-
+    // Les clients pourront voir ton device, lire son nom, et se connecter
     err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, NULL, 0, NULL, 0);
     if (err) {
         printk("Échec publicité BLE (%d)\n", err);
-        return;
+        return 0;
     }
 
     printk("Publicité démarrée\n");
+
+    // Initialisation 1ier appel
+    //Remonte l'état des 24 entrées. Chaque x correspond à l'état (0 ou 1) d'une entrée. La trame est émise toutes les 5s ou lors d'un changement d'état sur l'une des IO
+    k_work_schedule(&optos_read_work, TRAME_INTERVAL);
+
+    //k_work_schedule(&trame_work, TRAME_INTERVAL);
 }
