@@ -1,20 +1,43 @@
-# Ne pas versionner les dossiers de build
+# Ignorer dossiers build et Zephyr
 build/
 zephyr/
 
-# Fichiers temporaires de west
+# Ignorer fichiers temporaires west et logs
 *.log
 *.pyc
 *.swp
 *.swo
 *.user
 
-# Fichiers générés
+# Fichiers objets et binaires générés
 *.o
 *.elf
 *.hex
 *.bin
 
-# Dossiers temporaires d'IDE (VS Code, etc.)
+# Dossiers IDE temporaires
 .vscode/
 .idea/
+
+# Ignorer tous les PDFs sauf ceux dans docs/manuals/
+*.pdf
+!docs/manuals/*.pdf
+# Ignorer tous les fichiers .odt sauf ceux dans docs/manuals/
+*.odt
+!docs/manuals/*.odt
+
+# Ignorer documentation générée Doxygen / LaTeX (HTML, Latex, logs)
+docs/html/
+docs/latex/
+docs/refman.tex
+docs/latex-refman.pdf
+docs/doxygen.log
+
+# Ignorer fichiers auxiliaires LaTeX
+*.aux
+*.toc
+*.out
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
